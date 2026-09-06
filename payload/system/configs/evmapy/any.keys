@@ -1,0 +1,10 @@
+{
+  "actions_player1": [
+    {
+      "trigger": ["hotkey", "select"],
+      "type": "exec",
+      "target": "setsid /userdata/system/gameguide/gameguide-launch.sh </dev/null >/dev/null 2>&1 &",
+      "description": "MENU + SELECT: open the text guide. The only combo on this device that RetroArch never assigns and the ES remap menu cannot claim. Change it with: gameguide.py --set-hotkey \"...\""
+    }
+  ]
+}

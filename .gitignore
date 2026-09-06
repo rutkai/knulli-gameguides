@@ -1,0 +1,10 @@
+# Runtime state the tool writes next to itself on the device; never committed.
+gameguide.log
+gameguide.log.1
+positions.conf
+*.bak
+*.tmp
+gameguide.conf.new
+
+__pycache__/
+*.py[cod]
