@@ -76,7 +76,6 @@ mkdir -p "${DEST}/system/gameguide" \
 
 cp -f "${SRC}/system/gameguide/gameguide.py"         "${DEST}/system/gameguide/"
 cp -f "${SRC}/system/gameguide/gameguide-launch.sh"  "${DEST}/system/gameguide/"
-cp -f "${SRC}/system/gameguide/README.md"            "${DEST}/system/gameguide/" 2>/dev/null || true
 cp -f "${SRC}/guides/README.txt"                     "${DEST}/guides/" 2>/dev/null || true
 
 # Never clobber a config the user has already tuned.

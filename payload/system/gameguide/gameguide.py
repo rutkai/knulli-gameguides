@@ -842,6 +842,7 @@ class PadMapping:
         # `hotkey` and `select` are the *same physical button*, and a combo
         # naming both collapses to one event.
         self.es_buttons: dict[str, int] = {}
+        self.es_axes: dict[str, int] = {}
 
     @classmethod
     def load(cls, path: str | None = None) -> "PadMapping":
@@ -870,6 +871,7 @@ class PadMapping:
                     mapping.buttons[int(code)] = iname
                     mapping.es_buttons[iname] = int(code)
                 elif itype == "axis" and code and code.isdigit():
+                    mapping.es_axes[iname] = int(code)
                     if iname in ("joystick1up", "joystick2up", "up"):
                         mapping.stick_axes[int(code)] = "vertical"
         if mapping.device_names:
@@ -1556,10 +1558,14 @@ def diagnostics(conf: dict) -> int:
         print("best combo     : %s%s -- %s"
               % (" + ".join(b.upper() for b in best),
                  "" if best_hold <= 0 else " (hold %.2gs)" % best_hold, why))
-        for names, _h, _w in CANDIDATE_COMBOS:
+        print("analog sticks  : %s"
+              % ("yes" if has_analog_sticks(mapping) else
+                 "no -- MENU+SELECT is also KNULLI's D-pad toggle here"))
+        for names, _h, _w, caveat in CANDIDATE_COMBOS:
             ok, reason = validate_combo(mapping, names)
-            print("                 %-22s %s"
-                  % ("+".join(names), "usable" if ok else reason))
+            if ok:
+                reason = combo_caveat(mapping, caveat) or "usable"
+            print("                 %-22s %s" % ("+".join(names), reason))
 
     try:
         import evdev
@@ -1629,15 +1635,48 @@ def parse_combo(text: str) -> list[str]:
     return resolved
 
 
-# Candidate combos in preference order. The first that this controller can
-# actually express wins. Each is (names, hold, why).
+def has_analog_sticks(mapping: PadMapping) -> bool:
+    """
+    Does this handheld have real analog sticks?
+
+    It decides whether MENU + SELECT is free. KNULLI binds that combo to its
+    D-pad/virtual-joystick toggle, but only where there is no stick to begin
+    with -- /usr/bin/dpad-toggle opens with:
+
+        if knulli-board-capability "analogstick"; then exit 1; fi
+
+    The board capability flag is only readable on the device, so es_input.cfg
+    is used instead: it is the same signal KNULLI's own configgen uses to pick
+    between its single- and dual-joystick key maps, and a PC running the
+    installer against a mounted SHARE can read it too.
+    """
+    tool = "/usr/bin/knulli-board-capability"
+    if os.access(tool, os.X_OK):
+        try:
+            import subprocess
+            return subprocess.call([tool, "analogstick"],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL) == 0
+        except Exception:
+            pass
+    if not mapping.es_axes:
+        return False        # unknown: assume none, which is the safe answer
+    return any(name.startswith("joystick") for name in mapping.es_axes)
+
+
+# Candidate combos in preference order. The first this controller can express
+# wins. Each is (names, hold, why, caveat) -- a caveat is reported but does not
+# rule a combo out; only something that would actually break evmapy does.
 CANDIDATE_COMBOS = [
     (["hotkey", "select"], 0.0,
-     "the only MENU combo KNULLI never assigns; the game never sees it"),
+     "RetroArch never binds it, and the game never sees it",
+     "analogstick"),
     (["l2", "r2"], 0.5,
-     "not a RetroArch hotkey, and absent entirely on pre-PSX systems"),
+     "not a RetroArch hotkey, and absent entirely on pre-PSX systems",
+     None),
     (["pageup", "pagedown"], 0.75,
-     "L1+R1 held; last resort, the game does see these"),
+     "L1+R1 held; last resort, the game does see these",
+     None),
 ]
 
 
@@ -1664,12 +1703,30 @@ def validate_combo(mapping: PadMapping, names: list[str]) -> tuple[bool, str]:
     return True, "ok"
 
 
+def combo_caveat(mapping: PadMapping, caveat: str | None) -> str:
+    """A thing worth knowing about a combo, or "" if there is nothing."""
+    if caveat == "analogstick" and not has_analog_sticks(mapping):
+        return ("this handheld has no analog stick, so KNULLI also uses "
+                "MENU+SELECT for its D-pad / virtual-joystick toggle "
+                "(/usr/bin/dpad-toggle) -- both will fire")
+    return ""
+
+
 def choose_combo(mapping: PadMapping) -> tuple[list[str], float, str]:
-    for names, hold, why in CANDIDATE_COMBOS:
+    for names, hold, why, _caveat in CANDIDATE_COMBOS:
         ok, _ = validate_combo(mapping, names)
         if ok:
             return names, hold, why
-    return CANDIDATE_COMBOS[-1][0], CANDIDATE_COMBOS[-1][1], "nothing else fits"
+    last = CANDIDATE_COMBOS[-1]
+    return last[0], last[1], "nothing else fits"
+
+
+def _warn_caveat(mapping: PadMapping, trigger: list[str]) -> None:
+    for names, _hold, _why, caveat in CANDIDATE_COMBOS:
+        if names == trigger:
+            note = combo_caveat(mapping, caveat)
+            if note:
+                print("note        : %s" % note)
 
 
 def set_hotkey(combo: str, hold: float | None) -> int:
@@ -1685,6 +1742,7 @@ def set_hotkey(combo: str, hold: float | None) -> int:
         print("controller  : %s" % (", ".join(mapping.device_names) or "unknown"))
         print("chosen combo: %s  -- %s"
               % (" + ".join(t.upper() for t in trigger), why))
+        _warn_caveat(mapping, trigger)
     else:
         if hold is None:
             hold = 0.0
@@ -1699,6 +1757,7 @@ def set_hotkey(combo: str, hold: float | None) -> int:
             print("       KNULLI would merge those into one event and evmapy "
                   "would reject\n       the whole key map. Try --set-hotkey auto.")
             return 1
+        _warn_caveat(mapping, trigger)
 
     if len(trigger) == 1 and hold <= 0:
         print("refusing a single-button hotkey with no hold time: it would\n"
