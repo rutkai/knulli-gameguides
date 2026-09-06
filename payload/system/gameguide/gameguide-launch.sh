@@ -9,7 +9,12 @@
 
 BASE_DIR="$(dirname "$(readlink -f "$0")")"
 VIEWER="${BASE_DIR}/gameguide.py"
-LOG_FILE="${BASE_DIR}/gameguide.log"
+# Same choice gameguide.py makes: join KNULLI's own logs when we can.
+if [ -d /userdata/system/logs ] && [ -w /userdata/system/logs ]; then
+    LOG_FILE="/userdata/system/logs/gameguide.log"
+else
+    LOG_FILE="${BASE_DIR}/gameguide.log"
+fi
 LOCK_FILE="/var/run/gameguide.lock"
 PYTHON="$(command -v python3 || echo /usr/bin/python3)"
 

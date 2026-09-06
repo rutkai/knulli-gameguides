@@ -1,9 +1,12 @@
-# KNULLI Game Guides — for the TrimUI Brick
+# KNULLI Game Guides
 
 A port of the ROCKNIX [Game Guides](https://rocknix.org/configure/gameguides/)
-feature to KNULLI. Press **MENU + SELECT** during a game and a GameFAQs-style
+feature to KNULLI. Press the guide hotkey during a game and a GameFAQs-style
 text walkthrough covers the screen; press **A** or **B** and you are back in
 the game, at the same frame, with your place in the guide remembered.
+
+Resolution, pixel format, controller layout and hotkey are all worked out from
+the device at install time, so there is nothing to edit per handheld.
 
 Everything installs into the **SHARE / userdata partition only**, so a KNULLI
 update cannot remove it and **no boot overlay is needed**. See
@@ -25,6 +28,30 @@ update cannot remove it and **no boot overlay is needed**. See
             └── README.md                 full technical notes
 ```
 
+## Supported devices
+
+The guide is drawn straight into `/dev/fb0` while the emulator is suspended,
+which works on the KNULLI platforms whose SDL2 uses the **mali fbdev** driver.
+That is what decides support, not the screen size — resolution and pixel
+format are read from the device at run time.
+
+| Platform | Devices | Status |
+|---|---|---|
+| Allwinner **A133** | TrimUI Brick, TrimUI Smart Pro, Powkiddy V20 / V90s, MagicX Zero 28 / 40, XU20 | **Verified on the Brick.** Others share the driver and are expected to work. |
+| Allwinner **H700** | Anbernic RG28XX, RG34XX, RG35XX (Plus / H / SP / Pro / 2024), RG40XX H / V, RGCubeXX | Same `malifb` SDL2 driver, so expected to work — unverified. See the rotation note below. |
+| Rockchip **RK3566** | Powkiddy RGB30 / X55, Miyoo Flip, Anbernic RG Arc S | **Not supported.** These run KMSDRM; there is no scanned-out `/dev/fb0` to draw into. |
+| **Snapdragon 865** | Retroid Pocket 5 / Mini / Flip 2 | **Not supported.** KMSDRM as well. |
+
+On an unsupported platform the tool refuses with an explanation rather than
+half-working; it never leaves an emulator suspended.
+
+**Rotation is handled.** A panel mounted sideways presents a portrait
+framebuffer, and KNULLI's SDL2 turns everything drawn into it. The guide
+reproduces that driver's own rule — `(vinfo.xres < vinfo.yres) ? 1 : 0` — and
+honours the same `SDL_ROTATION` override, so it lands the same way up as the
+emulator. If a device turns out to need the other direction, `rotate = 90 |
+180 | 270` in `gameguide.conf` forces it.
+
 ## Install
 
 With the SD card in this PC:
@@ -33,10 +60,19 @@ With the SD card in this PC:
 ./install.sh /run/media/<you>/SHARE
 ```
 
-`install.sh` also accepts no argument and defaults to `/userdata`, for running
-it on the Brick itself — but that means copying this whole folder there first,
-since neither the installer nor `payload/` is part of what gets installed.
-Driving it from the PC over SMB or a card reader is the normal path.
+Or copy this folder anywhere onto the device and run it with no argument — it
+walks up from the current directory to find the userdata root, so both of
+these work:
+
+```sh
+cd /userdata && /userdata/gameguides/install.sh
+cd /userdata/gameguides && ./install.sh
+```
+
+The installer reads the device's `es_input.cfg` and binds **the best hotkey
+that controller can actually express**, printing which one it chose and why.
+On handhelds with a dedicated MENU button that is MENU + SELECT; where SELECT
+*is* the hotkey, it falls back automatically.
 
 Then launch any game — the hotkey is picked up the next time a game starts,
 no reboot required.
@@ -55,7 +91,7 @@ Then, in game:
 
 | Input | Action |
 |---|---|
-| **MENU + SELECT** | open the guide |
+| **the hotkey the installer chose** | open the guide |
 | D-pad up / down | scroll |
 | L1 / R1 | page up / page down |
 | D-pad left / right | text size − / + |
@@ -65,35 +101,63 @@ Then, in game:
 
 ## Choosing the hotkey
 
-**MENU + SELECT** is the default, and on this device it is the only two-button
-combination that nothing else uses. That is not a guess — it falls out of
-three independent facts:
+The installer picks this per device, because the right answer differs. Ask it
+what it decided, or change it, with one command:
+
+```sh
+python3 /userdata/system/gameguide/gameguide.py --set-hotkey auto
+python3 /userdata/system/gameguide/gameguide.py --set-hotkey "select+l2+r2" --hold 0.3
+```
+
+Names: `a b x y start select hotkey pageup pagedown l2 r2 up down left right`,
+with `l1`/`r1`/`menu` as aliases. `--hold` defaults to instant. Relaunch the
+game afterwards — evmapy reads the binding when a game starts.
+
+### What it picks, and why
+
+| Preference | Combo | Reason |
+|---|---|---|
+| 1 | **MENU + SELECT**, instant | The only MENU combo KNULLI never assigns, and RetroArch blocks core input while the hotkey button is held, so the game never sees it. |
+| 2 | **L2 + R2**, held ½ s | For handhelds where SELECT *is* the hotkey. Not a RetroArch combo, and absent entirely as game input on pre-PSX systems. |
+| 3 | **L1 + R1**, held ¾ s | Last resort for pads with no analog triggers. The game does see these. |
+
+Preference 1 is safe for a structural reason, not by luck:
 
 - `libretroControllers.py` builds RetroArch's hotkey table from a fixed
   dictionary: `x y a b start up down left right pageup pagedown l2 r2`.
   `select` is not in it, so RetroArch never binds MENU + SELECT.
 - The *Retroarch Hotkeys* remap menu offers that same list plus `l3`/`r3`.
-  `select` is not offered, so no future remap can take it either.
-- No `evmapy` `.keys` file anywhere in the KNULLI tree uses
-  `["hotkey", "select"]`.
+  `select` is not offered, so no later remap can take it either.
+- No `evmapy` `.keys` file in the KNULLI tree uses `["hotkey", "select"]`.
 
-To re-check those claims against upstream:
+But it is **not** universally available. On handhelds without a dedicated MENU
+button, `hotkey` and `select` are the same physical button. KNULLI's configgen
+merges them into one event, and evmapy then rejects the *entire* key map with
+`duplicate event(s) in action trigger` — taking any other actions down with
+it. So the tool validates every combo against `es_input.cfg` and refuses one
+it knows would collapse:
+
+```
+$ gameguide.py --set-hotkey "hotkey+select"
+error: 'hotkey' and 'select' are the same physical button on this controller (code 314)
+       KNULLI would merge those into one event and evmapy would reject
+       the whole key map. Try --set-hotkey auto.
+```
+
+To re-check the claims above against upstream:
 
 | Claim | Source |
 |---|---|
 | RetroArch hotkey table | [`knulli-linux`](https://github.com/knulli-cfw/knulli-linux) → `package/system/knulli-configgen/configgen/configgen/generators/libretro/libretroControllers.py` (`default_specials`) |
 | Remap menu choices | same repo → `package/emulationstation/knulli-es-system/es_features.yml` (`hotkey_*`) |
-| evmapy merge order and `exec` actions | on-device `/usr/lib/python3.12/site-packages/configgen/utils/evmapy.py` |
+| evmapy merge order, aliasing and `exec` actions | on-device `/usr/lib/python3.12/site-packages/configgen/utils/evmapy.py` |
 | The feature this ports | [`ROCKNIX/distribution`](https://github.com/ROCKNIX/distribution) → `projects/ROCKNIX/packages/apps/sdl2text/` |
 
-And because RetroArch blocks core input while the hotkey-enable button is
-held, the game never sees the SELECT press.
+### Per-system remaps make MENU more crowded
 
-Per-system `hotkey_*` remaps in `knulli.conf` make the rest of the MENU family
-*more* crowded, not less. A worked example — a `gb` section carrying
-`hotkey_left=l2`, `hotkey_right=r2`, `hotkey_l1=none`, `hotkey_r1=none`,
-`hotkey_l2=pageup`, `hotkey_r2=pagedown`, run through
-`libretroControllers.py`, resolves to:
+`hotkey_*` entries in `knulli.conf` move RetroArch's specials around. A `gb`
+section carrying `hotkey_left=l2`, `hotkey_right=r2`, `hotkey_l1=none`,
+`hotkey_r1=none`, `hotkey_l2=pageup`, `hotkey_r2=pagedown` resolves to:
 
 | Combo | Effective action |
 |---|---|
@@ -108,32 +172,8 @@ Per-system `hotkey_*` remaps in `knulli.conf` make the rest of the MENU family
 MENU + LEFT and MENU + RIGHT are free *in that example*, because rewind and
 fast-forward moved to the triggers — but on every other system they are still
 rewind and fast-forward, and `any.keys` applies to all systems, so they are not
-safe to bind here. MENU + SELECT is free either way.
-
-### Changing it
-
-One command, no JSON editing:
-
-```sh
-python3 /userdata/system/gameguide/gameguide.py --set-hotkey "select+l2+r2" --hold 0.3
-```
-
-Names: `a b x y start select hotkey pageup pagedown l2 r2 up down left right`,
-with `l1`/`r1`/`menu` as aliases. `--hold` defaults to 0 (instant), matching
-the shipped binding. Relaunch the game afterwards — evmapy reads the binding
-when a game starts.
-
-If MENU + SELECT ever feels wrong, the next-best options are three-button
-combos that no emulator and no RetroArch hotkey can claim:
-
-| Combo | Command |
-|---|---|
-| SELECT + L2 + R2 | `--set-hotkey "select+l2+r2" --hold 0.3` |
-| START + L2 + R2 | `--set-hotkey "start+l2+r2" --hold 0.3` |
-
-Avoid plain **L2 + R2** if you have remapped rewind and fast-forward onto the
-triggers, as the example above does: it is not a RetroArch hotkey, but holding
-both at once then becomes something you do during normal play.
+safe to bind. Avoid plain **L2 + R2** on a setup like that too: holding both
+triggers at once is then something you do during normal play.
 
 ## Why no overlay
 
@@ -162,8 +202,8 @@ remember to delete the overlay before updating.
 
 This is the part that could not simply be copied from ROCKNIX. ROCKNIX runs a
 Wayland compositor, so its `sdl2text` viewer just opens a second fullscreen
-window on top of the emulator. KNULLI on the Brick has no compositor at all —
-its SDL2 build contains exactly two video drivers, `mali` and `dummy`, and
+window on top of the emulator. KNULLI's Allwinner builds have no compositor at
+all — SDL2 there contains exactly two video drivers, `mali` and `dummy`, and
 `mali` is a bare fbdev/EGL backend. Two EGL surfaces would fight over the same
 framebuffer.
 
@@ -196,14 +236,14 @@ locals. Run one of them before copying anything to the device.
 
 ## Verify / troubleshoot
 
-Over SSH on the Brick, with a game running:
+Over SSH on the device, with a game running:
 
 ```sh
 python3 /userdata/system/gameguide/gameguide.py --diag            # environment report
 python3 /userdata/system/gameguide/gameguide.py --test            # built-in test page
 python3 /userdata/system/gameguide/gameguide.py --test --renderer sdl
 python3 /userdata/system/gameguide/gameguide.py --probe           # which slot reaches the panel?
-cat /userdata/system/gameguide/gameguide.log                      # what happened last
+cat /userdata/system/logs/gameguide.log                           # what happened last
 ```
 
 **If the emulator freezes but nothing appears**, that is the display path, not
@@ -227,7 +267,7 @@ is not matching; a log line but no guide means the viewer failed.
 
 ## Status on hardware
 
-Confirmed working on the Brick, KNULLI *scarab*:
+Confirmed on a TrimUI Brick, KNULLI *scarab*:
 
 - pygame 2.5.2 / SDL 2.32.8 / Python 3.12.8 present; pad map read from
   `es_input.cfg`; guide lookup resolves against real ROMs.
@@ -243,9 +283,15 @@ the slot after the freeze and using `FBIOPAN_DISPLAY` to make our slot the
 visible one. `--probe` exists to settle it empirically if the driver turns out
 to ignore panning.
 
-Still unverified: how a *standalone* (non-libretro) emulator reacts to being
-`SIGSTOP`ped mid-frame. RetroArch, which covers nearly everything on the
-Brick, carries on without complaint.
+Still unverified:
+
+- Every non-A133 device. H700 shares the display driver, and resolution,
+  rotation, controller layout and hotkey are all derived from the device, so it
+  should behave the same — but nobody has run it there yet. RK3566 and
+  Snapdragon are known not to work and say so rather than failing obscurely.
+- How a *standalone* (non-libretro) emulator reacts to being `SIGSTOP`ped
+  mid-frame. RetroArch, which covers nearly everything on these handhelds,
+  carries on without complaint.
 
 ## Licence
 

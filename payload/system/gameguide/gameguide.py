@@ -4,13 +4,15 @@
 KNULLI Game Guides -- an in-game GameFAQs-style text guide viewer.
 
 A re-implementation of the ROCKNIX "Game Guides" feature for KNULLI
-(Batocera-like) devices, written for the TrimUI Brick but device agnostic.
+(Batocera-like) handhelds. Resolution, pixel format, controller layout and
+hotkey are all detected at run time; the requirement is a scanned-out
+/dev/fb0, which KNULLI's Allwinner A133 and H700 devices have.
 
 How it works
 ------------
-KNULLI on the Brick has no compositor: SDL2 only ships the "mali" (fbdev/EGL)
-video driver, so a second GPU surface cannot be stacked on top of a running
-emulator.  Instead this tool:
+KNULLI's Allwinner builds have no compositor: SDL2 only ships the "mali"
+(fbdev/EGL) video driver, so a second GPU surface cannot be stacked on top of
+a running emulator.  Instead this tool:
 
   1. locates the running game via /proc (the `emulatorlauncher` command line),
   2. finds the matching .txt guide,
@@ -29,7 +31,7 @@ Usage
   gameguide.py --run                 open the guide for the running game
   gameguide.py --show FILE.txt       open an arbitrary text file
   gameguide.py --test                show a built-in test page
-  gameguide.py --set-hotkey "..."    change the combo that opens the guide
+  gameguide.py --set-hotkey auto     bind the best combo for this controller
   gameguide.py --probe               find out what actually reaches the panel
   gameguide.py --resume              SIGCONT anything a crashed run left stopped
   gameguide.py --diag                print environment diagnostics and exit
@@ -56,10 +58,35 @@ import xml.etree.ElementTree as ET
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_FILE = os.path.join(BASE_DIR, "gameguide.conf")
 POS_FILE = os.path.join(BASE_DIR, "positions.conf")
-LOG_FILE = os.path.join(BASE_DIR, "gameguide.log")
 STOPPED_FILE = "/var/run/gameguide.stopped"
 
-ES_INPUT_CFG = "/userdata/system/configs/emulationstation/es_input.cfg"
+
+def _default_log_file() -> str:
+    """KNULLI collects logs in one place; join them rather than litter."""
+    for directory in ("/userdata/system/logs", "/var/log"):
+        if os.path.isdir(directory) and os.access(directory, os.W_OK):
+            return os.path.join(directory, "gameguide.log")
+    return os.path.join(BASE_DIR, "gameguide.log")
+
+
+LOG_FILE = _default_log_file()
+
+# Everything the tool reads or writes outside its own directory hangs off this
+# root, so an installer running on a PC can point it at a mounted SHARE
+# partition instead of the device's own /userdata. Override with --userdata.
+USERDATA = "/userdata"
+ES_INPUT_CFG = USERDATA + "/system/configs/emulationstation/es_input.cfg"
+
+
+def set_userdata_root(root: str) -> None:
+    global USERDATA, ES_INPUT_CFG, ANY_KEYS, LOG_FILE
+    USERDATA = os.path.abspath(root)
+    logs = os.path.join(USERDATA, "system", "logs")
+    if os.path.isdir(logs) and os.access(logs, os.W_OK):
+        LOG_FILE = os.path.join(logs, "gameguide.log")
+    ES_INPUT_CFG = os.path.join(
+        USERDATA, "system", "configs", "emulationstation", "es_input.cfg")
+    ANY_KEYS = os.path.join(USERDATA, "system", "configs", "evmapy", "any.keys")
 
 # ---------------------------------------------------------------------------
 # logging
@@ -100,7 +127,8 @@ DEFAULTS = {
         "/usr/share/libretro/assets/ozone/regular.ttf",
         "/usr/share/emulationstation/resources/ubuntu_condensed.ttf",
     ]),
-    "font_size": "20",
+    "font_size": "auto",
+    "target_columns": "80",
     "font_size_min": "10",
     "font_size_max": "48",
     "fg": "#e8e8e8",
@@ -114,7 +142,9 @@ DEFAULTS = {
     "repeat_rate": "0.035",       # seconds between auto-repeat ticks
     "max_fps": "30",
     "guide_dirs": "/userdata/guides",
+    "log_file": "",
     "renderer": "fb",
+    "rotate": "auto",
     "fbdev": "/dev/fb0",
     "fb_force_pan": "1",
     "fb_all_buffers": "0",
@@ -434,11 +464,12 @@ class Framebuffer:
     """Direct /dev/fb0 access -- no EGL, so it cannot fight the GPU driver."""
 
     def __init__(self, device: str = "/dev/fb0", force_pan: bool = True,
-                 all_buffers: int = 0):
+                 all_buffers: int = 0, rotate: str = "auto"):
         self.path = device
         self.fd = os.open(device, os.O_RDWR)
         self.force_pan = force_pan
         self.all_buffers = all_buffers
+        self._rotate_setting = rotate
 
         var = bytearray(_VAR_FMT_LEN)
         fcntl.ioctl(self.fd, FBIOGET_VSCREENINFO, var, True)
@@ -472,7 +503,7 @@ class Framebuffer:
 
         self.frame_bytes = self.yres * self.line_length
         # How many screen-sized slots the virtual framebuffer can hold. On the
-        # Brick this is 21 (1024x16384), and the emulator pans freely between
+        # Brick this is 21 (1024x16384); the emulator pans freely between
         # them -- which is why the visible slot must be resolved in acquire(),
         # after the emulator has been suspended, not here.
         self.slot_count = max(1, min(self.yres_virtual // max(1, self.yres),
@@ -485,8 +516,40 @@ class Framebuffer:
         # Painting before acquire() means painting into whichever slot happened
         # to be current when this object was constructed, which is exactly the
         # bug that made the guide render intermittently.
+        self.rotation = self._resolve_rotation()
         self._acquired = False
         self._saved: dict[int, bytes] | None = None
+
+    def _resolve_rotation(self) -> int:
+        """
+        Quarter-turns to apply before writing, matching what SDL2 does here.
+
+        KNULLI's H700 mali driver decides with:
+            data->rotation = (vinfo.xres < vinfo.yres) ? 1 : 0;
+            rotation = SDL_GetHint("SDL_ROTATION");
+        so a panel mounted sideways presents a portrait framebuffer and
+        everything drawn into it is rotated on the way to the glass. The same
+        rule is used here, and the same SDL_ROTATION override is honoured, so
+        the guide lands the same way up as the emulator.
+        """
+        setting = str(self._rotate_setting).strip().lower()
+        if setting not in ("auto", ""):
+            try:
+                degrees = int(setting)
+            except ValueError:
+                log("fb: bad rotate=%r, using auto" % setting)
+            else:
+                return (degrees // 90) % 4
+        env = os.environ.get("SDL_ROTATION")
+        if env and env.strip().lstrip("-").isdigit():
+            return int(env.strip()) % 4
+        return 1 if self.xres < self.yres else 0
+
+    def draw_size(self) -> tuple[int, int]:
+        """Page size to lay out, before rotation into the framebuffer."""
+        if self.rotation % 2:
+            return self.yres, self.xres
+        return self.xres, self.yres
 
     def _require_acquired(self, what: str) -> None:
         if not self._acquired:
@@ -564,17 +627,31 @@ class Framebuffer:
                 mask(self.transp))
 
     def surface_width(self) -> int:
-        """Width that makes a pygame surface pitch match line_length exactly."""
+        """
+        Width to allocate the page at.
+
+        Unrotated, padding out to the framebuffer stride makes the surface
+        pitch match line_length exactly, so a frame is one memcpy. Rotated,
+        the page is laid out at the logical size and transformed on present,
+        so there is nothing to align.
+        """
+        if self.rotation:
+            return self.draw_size()[0]
         return self.line_length // self.bytes_pp
 
     def page_surface(self):
         """The Surface the viewer draws into, in this display's pixel format."""
         import pygame
-        return pygame.Surface((self.surface_width(), self.yres), 0, self.bpp,
+        height = self.draw_size()[1]
+        return pygame.Surface((self.surface_width(), height), 0, self.bpp,
                               self.masks())
 
     def present(self, surface) -> None:
         self._require_acquired("present")
+        if self.rotation:
+            import pygame
+            # pygame rotates counter-clockwise for positive angles
+            surface = pygame.transform.rotate(surface, -90 * self.rotation)
         self.blit(surface.get_buffer(), surface.get_pitch())
 
     # -- content ------------------------------------------------------------
@@ -621,8 +698,9 @@ class Framebuffer:
             pass
 
     def describe(self) -> str:
+        rot = "" if not self.rotation else " rot=%d" % (self.rotation * 90)
         return ("%s %dx%d virt %dx%d @%d,%d %dbpp stride=%d smem=%d "
-                "R%s G%s B%s A%s") % (
+                "R%s G%s B%s A%s" + rot) % (
             self.path, self.xres, self.yres, self.xres_virtual,
             self.yres_virtual, self.xoffset, self.yoffset, self.bpp,
             self.line_length, self.smem_len, self.red, self.green,
@@ -633,7 +711,7 @@ class SdlOutput:
     """
     Fallback display path: draw through SDL2 instead of /dev/fb0.
 
-    KNULLI's SDL2 on the Brick only has the "mali" (fbdev/EGL) video driver,
+    KNULLI's SDL2 on Allwinner only has the "mali" (fbdev/EGL) video driver,
     so this creates a second fullscreen EGL surface. That is only safe because
     the emulator is suspended and therefore not flipping buffers itself. Use
     it by setting `renderer = sdl` in gameguide.conf if the direct
@@ -655,6 +733,10 @@ class SdlOutput:
 
     def masks(self):
         return self.screen.get_masks()
+
+    def draw_size(self) -> tuple[int, int]:
+        # SDL applies the panel rotation itself, so this is already correct.
+        return self.xres, self.yres
 
     def surface_width(self) -> int:
         return self.xres
@@ -697,9 +779,20 @@ def open_output(conf: dict, override: str | None = None):
     # EGL surface against a GPU the emulator still owns and has never run on any
     # hardware; quietly switching to it on an unrelated failure would turn a
     # clear error into an unpredictable one. Ask for it explicitly instead.
-    return Framebuffer(conf.get("fbdev", "/dev/fb0"),
+    device = conf.get("fbdev", "/dev/fb0")
+    if not os.path.exists(device):
+        raise RuntimeError(
+            "%s does not exist.\n"
+            "This tool paints into the framebuffer, which works on KNULLI's\n"
+            "Allwinner devices (A133 and H700) because their SDL2 uses the\n"
+            "mali fbdev driver. Rockchip RK3566 and Snapdragon 865 devices\n"
+            "run on KMSDRM instead and have no scanned-out /dev/fb0, so the\n"
+            "guide cannot be drawn over a running emulator there yet."
+            % device)
+    return Framebuffer(device,
                        force_pan=conf_bool(conf, "fb_force_pan", True),
-                       all_buffers=conf_int(conf, "fb_all_buffers", 0))
+                       all_buffers=conf_int(conf, "fb_all_buffers", 0),
+                       rotate=str(conf.get("rotate", "auto")))
 
 
 # ---------------------------------------------------------------------------
@@ -743,9 +836,19 @@ class PadMapping:
         self.stick_axes: dict[int, str] = {}     # abs code -> "vertical"
         self.device_names: list[str] = []
         self.source = "built-in defaults"
+        # Exactly what es_input.cfg declares, name -> code, with none of the
+        # built-in fallbacks mixed in. Hotkey validation has to reason about
+        # the real controller: on handhelds with no dedicated MENU button,
+        # `hotkey` and `select` are the *same physical button*, and a combo
+        # naming both collapses to one event.
+        self.es_buttons: dict[str, int] = {}
 
     @classmethod
-    def load(cls, path: str = ES_INPUT_CFG) -> "PadMapping":
+    def load(cls, path: str | None = None) -> "PadMapping":
+        # Resolved at call time, not definition time: --userdata rebinds the
+        # module global, and a default argument would have captured the old
+        # value when the class was first defined.
+        path = path or ES_INPUT_CFG
         mapping = cls()
         try:
             root = ET.parse(path).getroot()
@@ -765,6 +868,7 @@ class PadMapping:
                 code = node.get("code")
                 if itype == "button" and code and code.isdigit():
                     mapping.buttons[int(code)] = iname
+                    mapping.es_buttons[iname] = int(code)
                 elif itype == "axis" and code and code.isdigit():
                     if iname in ("joystick1up", "joystick2up", "up"):
                         mapping.stick_axes[int(code)] = "vertical"
@@ -1085,12 +1189,9 @@ class Viewer:
         self.font_path = self._pick_font()
 
         saved_scroll, saved_size = positions.get(position_key, (0, 0))
-        self.font_size = saved_size or conf_int(conf, "font_size", 20)
-        self.font_size = max(self.size_min, min(self.size_max, self.font_size))
 
         self.surface = out.page_surface()
-        self.width = out.xres
-        self.height = out.yres
+        self.width, self.height = out.draw_size()
 
         self.font = None
         self.line_height = 1
@@ -1101,7 +1202,19 @@ class Viewer:
         self.total_wrapped = 0
         self._cache: dict[int, object] = {}
 
-        self._apply_font_size(self.font_size)
+        # Screen sizes across KNULLI devices run from 640x480 to 1920x1080, so
+        # a fixed point size cannot suit them all. Default to whatever renders
+        # about `target_columns` monospaced characters across -- GameFAQs
+        # guides are laid out for ~79 columns, so that is the size at which
+        # their ASCII tables and maps line up without wrapping.
+        configured = str(conf.get("font_size", "auto")).strip().lower()
+        if saved_size:
+            start = saved_size
+        elif configured in ("auto", "0", ""):
+            start = self._auto_font_size()
+        else:
+            start = conf_int(conf, "font_size", 20)
+        self._apply_font_size(start)
 
         self.scroll = min(saved_scroll, max(0, self.total_wrapped - 1))
         self.show_help = conf_bool(conf, "help_on_open", False)
@@ -1109,6 +1222,17 @@ class Viewer:
         self.help_rows = list(HELP_ROWS)
         self.running = True
         self.dirty = True
+
+    def _auto_font_size(self) -> int:
+        """Point size whose advance width gives ~target_columns across."""
+        pygame = self.pygame
+        target = max(20, conf_int(self.conf, "target_columns", 80))
+        usable = max(1, self.width - 2 * self.margin_x)
+        probe_size = 20
+        probe = pygame.font.Font(self.font_path, probe_size)
+        probe_w = max(1, probe.size("M" * 20)[0] // 20)
+        size = int(round(probe_size * (usable / target) / probe_w))
+        return max(self.size_min, min(self.size_max, size))
 
     # -- font / layout ------------------------------------------------------
 
@@ -1427,6 +1551,16 @@ def diagnostics(conf: dict) -> int:
     print("buttons        : %s"
           % ", ".join("%s=%d" % (name, code) for code, name in named))
 
+    if mapping.es_buttons:
+        best, best_hold, why = choose_combo(mapping)
+        print("best combo     : %s%s -- %s"
+              % (" + ".join(b.upper() for b in best),
+                 "" if best_hold <= 0 else " (hold %.2gs)" % best_hold, why))
+        for names, _h, _w in CANDIDATE_COMBOS:
+            ok, reason = validate_combo(mapping, names)
+            print("                 %-22s %s"
+                  % ("+".join(names), "usable" if ok else reason))
+
     try:
         import evdev
         print("evdev nodes    :")
@@ -1465,7 +1599,7 @@ def diagnostics(conf: dict) -> int:
 # hotkey binding (evmapy)
 # ---------------------------------------------------------------------------
 
-ANY_KEYS = "/userdata/system/configs/evmapy/any.keys"
+ANY_KEYS = USERDATA + "/system/configs/evmapy/any.keys"
 LAUNCH_CMD = ("setsid /userdata/system/gameguide/gameguide-launch.sh "
               "</dev/null >/dev/null 2>&1 &")
 
@@ -1495,15 +1629,76 @@ def parse_combo(text: str) -> list[str]:
     return resolved
 
 
-def set_hotkey(combo: str, hold: float) -> int:
+# Candidate combos in preference order. The first that this controller can
+# actually express wins. Each is (names, hold, why).
+CANDIDATE_COMBOS = [
+    (["hotkey", "select"], 0.0,
+     "the only MENU combo KNULLI never assigns; the game never sees it"),
+    (["l2", "r2"], 0.5,
+     "not a RetroArch hotkey, and absent entirely on pre-PSX systems"),
+    (["pageup", "pagedown"], 0.75,
+     "L1+R1 held; last resort, the game does see these"),
+]
+
+
+def validate_combo(mapping: PadMapping, names: list[str]) -> tuple[bool, str]:
+    """
+    Can this controller actually produce this combination?
+
+    Returns (ok, reason). The important failure is two names resolving to one
+    physical button: KNULLI's configgen would alias them together and evmapy
+    would then reject the whole action list with "duplicate event(s) in action
+    trigger" -- taking any other actions down with it.
+    """
+    if not mapping.es_buttons:
+        return True, "controller unknown (no es_input.cfg), not validated"
+    codes: dict[int, str] = {}
+    for name in names:
+        if name not in mapping.es_buttons:
+            return False, "this controller has no '%s' button" % name
+        code = mapping.es_buttons[name]
+        if code in codes:
+            return False, ("'%s' and '%s' are the same physical button on this "
+                           "controller (code %d)" % (codes[code], name, code))
+        codes[code] = name
+    return True, "ok"
+
+
+def choose_combo(mapping: PadMapping) -> tuple[list[str], float, str]:
+    for names, hold, why in CANDIDATE_COMBOS:
+        ok, _ = validate_combo(mapping, names)
+        if ok:
+            return names, hold, why
+    return CANDIDATE_COMBOS[-1][0], CANDIDATE_COMBOS[-1][1], "nothing else fits"
+
+
+def set_hotkey(combo: str, hold: float | None) -> int:
     """Rewrite our action in any.keys, leaving any other actions alone."""
     import json
 
-    try:
-        trigger = parse_combo(combo)
-    except ValueError as exc:
-        print("error: %s" % exc)
-        return 1
+    mapping = PadMapping.load()
+
+    if combo.strip().lower() == "auto":
+        trigger, auto_hold, why = choose_combo(mapping)
+        if hold is None:
+            hold = auto_hold
+        print("controller  : %s" % (", ".join(mapping.device_names) or "unknown"))
+        print("chosen combo: %s  -- %s"
+              % (" + ".join(t.upper() for t in trigger), why))
+    else:
+        if hold is None:
+            hold = 0.0
+        try:
+            trigger = parse_combo(combo)
+        except ValueError as exc:
+            print("error: %s" % exc)
+            return 1
+        ok, reason = validate_combo(mapping, trigger)
+        if not ok:
+            print("error: %s" % reason)
+            print("       KNULLI would merge those into one event and evmapy "
+                  "would reject\n       the whole key map. Try --set-hotkey auto.")
+            return 1
 
     if len(trigger) == 1 and hold <= 0:
         print("refusing a single-button hotkey with no hold time: it would\n"
@@ -1613,8 +1808,8 @@ def probe_display(conf: dict, launcher_pid: int | None, seconds: float) -> int:
     print("font: %s" % font_path)
 
     def paint(fb, slot, label, colour):
-        surface = pygame.Surface((fb.surface_width(), fb.yres), 0, fb.bpp,
-                                 fb.masks())
+        surface = pygame.Surface((fb.line_length // fb.bytes_pp, fb.yres), 0,
+                                 fb.bpp, fb.masks())
         surface.fill(colour)
         big = pygame.font.Font(font_path, max(28, fb.yres // 12))
         small = pygame.font.Font(font_path, max(16, fb.yres // 28))
@@ -1750,23 +1945,32 @@ def main(argv: list[str]) -> int:
     group.add_argument("--diag", action="store_true",
                        help="print environment diagnostics")
     group.add_argument("--set-hotkey", metavar="COMBO",
-                       help='change the opening combo, e.g. '
-                            '--set-hotkey "select+l2+r2"')
+                       help='change the opening combo, e.g. "select+l2+r2". '
+                            'Use "auto" to pick the best one this controller '
+                            'can actually express')
     group.add_argument("--probe", action="store_true",
                        help="paint a labelled page into every framebuffer slot "
                             "and through SDL, to find what reaches the panel")
-    parser.add_argument("--hold", type=float, default=0.0,
+    parser.add_argument("--hold", type=float, default=None,
                         help="seconds the combo must be held; default 0 "
-                             "(instant), matching the shipped binding. Only "
-                             "used with --set-hotkey")
+                             "(instant) for an explicit combo, or whatever "
+                             "suits the one --set-hotkey auto picks")
     parser.add_argument("--renderer", choices=("fb", "sdl"),
                         help="override the configured display backend for "
                              "this run only")
     parser.add_argument("--probe-seconds", type=float, default=3.0,
                         help="how long each --probe step stays on screen")
+    parser.add_argument("--userdata", metavar="PATH",
+                        help="userdata root to read es_input.cfg from and write "
+                             "any.keys to; defaults to /userdata. Let an "
+                             "installer running on a PC target a mounted SHARE")
     args = parser.parse_args(argv)
 
     conf = load_conf()
+    if args.userdata:
+        set_userdata_root(args.userdata)
+    if conf.get("log_file", "").strip():
+        globals()["LOG_FILE"] = conf["log_file"].strip()
 
     if args.resume:
         resume_leftovers()

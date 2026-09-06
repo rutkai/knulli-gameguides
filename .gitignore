@@ -8,3 +8,6 @@ gameguide.conf.new
 
 __pycache__/
 *.py[cod]
+
+# IDE
+/.idea

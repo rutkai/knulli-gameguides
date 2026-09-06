@@ -5,15 +5,52 @@
 # outside userdata, so a KNULLI update cannot remove it and no boot overlay is
 # required.
 #
-# On the device (over SSH):        ./install.sh
 # From a PC with the SD mounted:   ./install.sh /run/media/<you>/SHARE
+# On the device:                   ./install.sh
+#
+# With no argument the destination is worked out from where you are standing:
+# the current directory if it is a userdata root, else the nearest one above
+# it, else /userdata. So copying this folder anywhere under userdata and
+# running ./install.sh from it does the right thing.
 #
 # SPDX-License-Identifier: MIT
 
 set -e
 
 SRC="$(dirname "$(readlink -f "$0")")/payload"
-DEST="${1:-/userdata}"
+
+# A userdata root has system/ and at least one of the things only userdata has.
+is_userdata_root() {
+    [ -d "${1}/system" ] || return 1
+    [ -d "${1}/roms" ] || [ -f "${1}/system/knulli.conf" ] ||
+        [ -f "${1}/system/batocera.conf" ] || return 1
+    return 0
+}
+
+find_userdata_root() {
+    dir="$(pwd -P)"
+    while [ -n "${dir}" ] && [ "${dir}" != "/" ]; do
+        if is_userdata_root "${dir}"; then
+            printf '%s' "${dir}"
+            return 0
+        fi
+        dir="$(dirname "${dir}")"
+    done
+    is_userdata_root "/userdata" && { printf '/userdata'; return 0; }
+    return 1
+}
+
+if [ -n "${1}" ]; then
+    DEST="${1}"
+elif DEST="$(find_userdata_root)"; then
+    echo ":: no path given -- detected userdata root at ${DEST}"
+else
+    echo "error: no path given and no KNULLI userdata root found here." >&2
+    echo "       Run this from inside userdata on the device, or pass the" >&2
+    echo "       path to the SHARE partition:" >&2
+    echo "         ./install.sh /run/media/<you>/SHARE" >&2
+    exit 1
+fi
 
 if [ ! -d "${SRC}" ]; then
     echo "error: payload directory not found at ${SRC}" >&2
@@ -23,9 +60,9 @@ if [ ! -d "${DEST}" ]; then
     echo "error: destination ${DEST} does not exist" >&2
     exit 1
 fi
-if [ ! -d "${DEST}/system" ]; then
+if ! is_userdata_root "${DEST}"; then
     echo "error: ${DEST} does not look like a KNULLI userdata/SHARE partition" >&2
-    echo "       (no 'system' folder inside it)" >&2
+    echo "       (expected a 'system' folder plus roms/ or system/knulli.conf)" >&2
     exit 1
 fi
 
@@ -67,10 +104,26 @@ chmod 0755 "${DEST}/system/gameguide/gameguide.py" \
 # ---------------------------------------------------------------------------
 ANY_KEYS="${DEST}/system/configs/evmapy/any.keys"
 NEW_KEYS="${SRC}/system/configs/evmapy/any.keys"
+ES_INPUT="${DEST}/system/configs/emulationstation/es_input.cfg"
 
-if [ ! -f "${ANY_KEYS}" ]; then
+# Pick the combo from the controller this userdata actually belongs to. The
+# shipped default (MENU+SELECT) is wrong on handhelds with no dedicated MENU
+# button, where SELECT *is* the hotkey: KNULLI would merge the two into one
+# event and evmapy would reject the whole key map.
+if [ ! -f "${ANY_KEYS}" ] && [ -n "${PYTHON}" ] && [ -f "${ES_INPUT}" ]; then
+    if "${PYTHON}" "${DEST}/system/gameguide/gameguide.py" \
+            --userdata "${DEST}" --set-hotkey auto | sed 's/^/   /'; then
+        echo ":: installed hotkey binding -> ${ANY_KEYS}"
+    else
+        cp -f "${NEW_KEYS}" "${ANY_KEYS}"
+        echo ":: installed default hotkey binding -> ${ANY_KEYS}"
+    fi
+elif [ ! -f "${ANY_KEYS}" ]; then
     cp -f "${NEW_KEYS}" "${ANY_KEYS}"
-    echo ":: installed hotkey binding -> ${ANY_KEYS}"
+    echo ":: installed default hotkey binding -> ${ANY_KEYS}"
+    echo "   (no es_input.cfg here yet, so the controller is unknown. If"
+    echo "    MENU+SELECT does nothing, run on the device:"
+    echo "      python3 /userdata/system/gameguide/gameguide.py --set-hotkey auto)"
 elif [ -n "${PYTHON}" ]; then
     "${PYTHON}" - "${ANY_KEYS}" "${NEW_KEYS}" <<'PYEOF'
 import json, shutil, sys

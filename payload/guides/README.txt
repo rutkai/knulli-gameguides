@@ -33,11 +33,14 @@ scrapers and gamelist.xml stay clean.
 Opening a guide
 ---------------
 
-While a game is running, press  MENU + SELECT.
+While a game is running, press the guide hotkey. The installer picks one that
+suits your controller and prints it; on handhelds with a dedicated MENU button
+it is MENU + SELECT. To ask, or to change it:
 
-(To use a different combination:
-     python3 /userdata/system/gameguide/gameguide.py --set-hotkey "select+l2+r2"
- then relaunch the game.)
+     python3 /userdata/system/gameguide/gameguide.py --diag
+     python3 /userdata/system/gameguide/gameguide.py --set-hotkey auto
+
+(Relaunch the game after changing it.)
 
     D-PAD UP / DOWN     scroll
     L1 / R1             page up / page down

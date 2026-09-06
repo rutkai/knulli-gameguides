@@ -6,8 +6,15 @@ Press a hotkey during a game and a GameFAQs-style plain-text walkthrough
 appears over it; press A or B and you are back in the game exactly where you
 left off.
 
-Built and tested against KNULLI *scarab* on a **TrimUI Brick** (Allwinner
-A133 / PowerVR GE8300, 1024x768), but nothing in it is Brick specific.
+Works on KNULLI's Allwinner devices — **A133** (TrimUI Brick / Smart Pro,
+Powkiddy V20 / V90s, MagicX Zero, XU20) and **H700** (Anbernic RG28XX / 34XX /
+35XX / 40XX / RGCubeXX) — whose SDL2 uses the mali fbdev driver. Verified on a
+TrimUI Brick. **Not** supported on RK3566 (RGB30, X55, Miyoo Flip, RG Arc S) or
+Snapdragon 865 (Retroid Pocket): those run KMSDRM and have no scanned-out
+`/dev/fb0`; the tool refuses with an explanation there.
+
+Resolution, pixel format, controller layout and hotkey are all detected, so
+there is nothing to tune per device.
 
 ## Files
 
@@ -17,7 +24,7 @@ A133 / PowerVR GE8300, 1024x768), but nothing in it is Brick specific.
 | `gameguide-launch.sh` | hotkey entry point; guarantees the emulator is un-suspended |
 | `gameguide.conf` | user settings (font, size, colours, scroll speed, renderer) |
 | `positions.conf` | per-guide reading position and text size (written automatically) |
-| `gameguide.log` | last few runs; the first place to look if something misbehaves |
+| `/userdata/system/logs/gameguide.log` | last few runs; the first place to look if something misbehaves |
 | `../configs/evmapy/any.keys` | the hotkey binding, merged into every emulator by KNULLI |
 
 ## Hotkey
@@ -81,8 +88,8 @@ Plain text only — UTF-8, CP1252 or Latin-1 are all decoded. Use the
 
 ## How it works, and why it works that way
 
-KNULLI on the Brick has no compositor. Its SDL2 build ships exactly two video
-drivers — `mali` and `dummy` — and `mali` is a straight fbdev/EGL backend.
+KNULLI's Allwinner builds have no compositor. SDL2 there ships exactly two
+video drivers — `mali` and `dummy` — and `mali` is a straight fbdev/EGL backend.
 There is no window manager to stack a second surface on top of a running
 emulator, so the ROCKNIX approach (a second fullscreen SDL window over a
 Wayland compositor) is not available.
@@ -113,8 +120,9 @@ Instead:
    contents are snapshotted first and put back on exit, so the game reappears
    instantly.
 
-   **Which buffer slot.** This panel's framebuffer is 1024x16384: twenty-one
-   screen-sized slots that the emulator pans between. The visible slot is
+   **Which buffer slot.** These framebuffers are far taller than the screen —
+   1024x16384 on the Brick, twenty-one screen-sized slots that the emulator
+   pans between. The visible slot is
    therefore resolved in `Framebuffer.acquire()`, *after* the emulator is
    suspended — reading it earlier gives an answer that is already stale by the
    time we draw, which is why an earlier version rendered correctly once and
@@ -123,15 +131,23 @@ Instead:
    is handed back on exit. `fb_all_buffers` (paint every slot) and
    `gameguide.py --probe` (paint a labelled page into each slot in turn) are
    there in case a driver ignores panning.
-5. **Monospaced text.** GameFAQs guides are ASCII art: tables, maps and
-   column-aligned item lists. A proportional font mangles them. Using a fixed
-   pitch also makes wrapping pure integer arithmetic, so a two-megabyte guide
-   opens instantly instead of measuring fifty thousand strings.
+5. **Monospaced text, sized to the panel.** GameFAQs guides are ASCII art:
+   tables, maps and column-aligned item lists. A proportional font mangles
+   them. Using a fixed pitch also makes wrapping pure integer arithmetic, so a
+   two-megabyte guide opens instantly instead of measuring fifty thousand
+   strings. `font_size = auto` then picks whatever gives ~80 columns, which is
+   the width guides are written for — 13pt on a 640x480 RG35XX, 21pt on a
+   Brick, 40pt on a 1080p panel.
+6. **Rotation.** A panel mounted sideways presents a portrait framebuffer, and
+   KNULLI's SDL2 turns everything drawn into it. `rotate = auto` reproduces
+   that driver's own rule — `(vinfo.xres < vinfo.yres) ? 1 : 0` — and honours
+   the same `SDL_ROTATION` override, so the guide lands the same way up as the
+   emulator.
 
 If the direct framebuffer path ever shows nothing on some other device, set
 `renderer = sdl` in `gameguide.conf` to go through SDL2 instead. That path
 creates a second EGL surface, which is only safe *because* the emulator is
-suspended.
+suspended, and it applies the panel rotation itself.
 
 ## Checking an install
 
