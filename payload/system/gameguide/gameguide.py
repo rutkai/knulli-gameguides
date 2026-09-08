@@ -33,6 +33,7 @@ Usage
   gameguide.py --test                show a built-in test page
   gameguide.py --set-hotkey auto     bind the best combo for this controller
   gameguide.py --probe               find out what actually reaches the panel
+  gameguide.py --dump DIR            capture the framebuffer for diagnosis
   gameguide.py --resume              SIGCONT anything a crashed run left stopped
   gameguide.py --diag                print environment diagnostics and exit
 
@@ -145,6 +146,7 @@ DEFAULTS = {
     "log_file": "",
     "renderer": "fb",
     "rotate": "auto",
+    "force_opaque": "1",
     "fbdev": "/dev/fb0",
     "fb_force_pan": "1",
     "fb_all_buffers": "0",
@@ -464,12 +466,14 @@ class Framebuffer:
     """Direct /dev/fb0 access -- no EGL, so it cannot fight the GPU driver."""
 
     def __init__(self, device: str = "/dev/fb0", force_pan: bool = True,
-                 all_buffers: int = 0, rotate: str = "auto"):
+                 all_buffers: int = 0, rotate: str = "auto",
+                 force_opaque: bool = True):
         self.path = device
         self.fd = os.open(device, os.O_RDWR)
         self.force_pan = force_pan
         self.all_buffers = all_buffers
         self._rotate_setting = rotate
+        self.force_opaque = force_opaque
 
         var = bytearray(_VAR_FMT_LEN)
         fcntl.ioctl(self.fd, FBIOGET_VSCREENINFO, var, True)
@@ -648,8 +652,20 @@ class Framebuffer:
 
     def present(self, surface) -> None:
         self._require_acquired("present")
+        import pygame
+        if self.force_opaque and self.transp[1]:
+            # This display engine can be told to honour the framebuffer's alpha
+            # channel -- /usr/bin/setalpha flips its layer between "opaque" and
+            # "transparent" via /dev/disp LayerConfig. pygame's blit copies the
+            # source alpha rather than compositing it away, so SDL_ttf's
+            # transparent glyph margins punch A=0 rectangles through the page.
+            # Invisible while the layer ignores alpha; the moment something
+            # leaves it in transparent mode every line of text turns into a
+            # see-through bar. Force the whole page opaque: BLEND_RGBA_MAX with
+            # a black, fully opaque source raises alpha to 255 and leaves the
+            # colour channels untouched.
+            surface.fill((0, 0, 0, 255), None, pygame.BLEND_RGBA_MAX)
         if self.rotation:
-            import pygame
             # pygame rotates counter-clockwise for positive angles
             surface = pygame.transform.rotate(surface, -90 * self.rotation)
         self.blit(surface.get_buffer(), surface.get_pitch())
@@ -792,7 +808,8 @@ def open_output(conf: dict, override: str | None = None):
     return Framebuffer(device,
                        force_pan=conf_bool(conf, "fb_force_pan", True),
                        all_buffers=conf_int(conf, "fb_all_buffers", 0),
-                       rotate=str(conf.get("rotate", "auto")))
+                       rotate=str(conf.get("rotate", "auto")),
+                       force_opaque=conf_bool(conf, "force_opaque", True))
 
 
 # ---------------------------------------------------------------------------
@@ -1947,6 +1964,76 @@ Now set the winner in /userdata/system/gameguide/gameguide.conf:
     return 0
 
 
+def dump_frames(conf: dict, launcher_pid: int | None, outdir: str) -> int:
+    """
+    Capture what is really in the framebuffer, for when the screen is wrong.
+
+    Suspends the emulator, saves the visible buffer as the emulator left it,
+    renders the test page, saves that, presents it, saves the result, then puts
+    everything back. Non-interactive. The .raw files are plain BGRA/pixel data
+    at the stated stride, so they can be inspected off-device.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    freezer = EmulatorFreezer(launcher_pid, conf_bool(conf, "stop_emulator", True))
+    fb = None
+    try:
+        fb = Framebuffer(conf.get("fbdev", "/dev/fb0"),
+                         force_pan=conf_bool(conf, "fb_force_pan", True),
+                         all_buffers=conf_int(conf, "fb_all_buffers", 0),
+                         rotate=str(conf.get("rotate", "auto")),
+                         force_opaque=conf_bool(conf, "force_opaque", True))
+        freezer.freeze()
+        fb.acquire()
+
+        def grab(name):
+            data = bytes(fb.mm[fb.visible_offset:
+                               fb.visible_offset + fb.frame_bytes])
+            with open(os.path.join(outdir, name), "wb") as fh:
+                fh.write(data)
+            alphas = {data[i + 3] for i in range(0, len(data), 4 * 997)}
+            print("  %-16s %8d bytes  alpha bytes seen: %s"
+                  % (name, len(data), sorted(alphas)[:6]))
+            return data
+
+        print("framebuffer: %s" % fb.describe())
+        print("captures written to %s:" % outdir)
+        fb.save()
+        grab("fb-before.raw")
+
+        viewer = Viewer(conf, fb, build_test_page({}), "dump", "__dump__", {})
+        viewer.draw()
+        with open(os.path.join(outdir, "page.raw"), "wb") as fh:
+            fh.write(bytes(viewer.surface.get_buffer()))
+        print("  %-16s %8d bytes  %dx%d pitch=%d"
+              % ("page.raw", viewer.surface.get_pitch() * viewer.height,
+                 viewer.surface.get_width(), viewer.surface.get_height(),
+                 viewer.surface.get_pitch()))
+        grab("fb-after.raw")
+
+        with open(os.path.join(outdir, "meta.txt"), "w") as fh:
+            fh.write("%s\n" % fb.describe())
+            fh.write("stride=%d bpp=%d xres=%d yres=%d rotation=%d\n"
+                     % (fb.line_length, fb.bpp, fb.xres, fb.yres, fb.rotation))
+            fh.write("page=%dx%d pitch=%d font=%dpt cols=%d rows=%d\n"
+                     % (viewer.surface.get_width(), viewer.surface.get_height(),
+                        viewer.surface.get_pitch(), viewer.font_size,
+                        viewer.cols, viewer.rows))
+            fh.write("font=%s\n" % viewer.font_path)
+            fh.write("force_opaque=%s\n" % fb.force_opaque)
+        fb.restore()
+    except Exception as exc:
+        import traceback
+        log("dump: %s\n%s" % (exc, traceback.format_exc()))
+        return 1
+    finally:
+        if fb is not None:
+            fb.release()
+            fb.close()
+        freezer.thaw()
+    print("\nSend those files back; they show exactly what reached the panel.")
+    return 0
+
+
 def build_test_page(info: dict) -> list[str]:
     """A guide-shaped page used by --test to prove the whole path works."""
     ruler = "".join(str(i % 10) for i in range(1, 101))
@@ -2007,6 +2094,9 @@ def main(argv: list[str]) -> int:
                        help='change the opening combo, e.g. "select+l2+r2". '
                             'Use "auto" to pick the best one this controller '
                             'can actually express')
+    group.add_argument("--dump", metavar="DIR",
+                       help="capture the framebuffer before and after drawing, "
+                            "for diagnosing a garbled screen")
     group.add_argument("--probe", action="store_true",
                        help="paint a labelled page into every framebuffer slot "
                             "and through SDL, to find what reaches the panel")
@@ -2046,6 +2136,8 @@ def main(argv: list[str]) -> int:
 
     if args.probe:
         return probe_display(conf, launcher_pid, args.probe_seconds)
+    if args.dump:
+        return dump_frames(conf, launcher_pid, args.dump)
 
     test_lines = None
     guide_path = None

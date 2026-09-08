@@ -73,6 +73,24 @@ misses those releases and still believes the combo is half-held, so a later
 lone SELECT press can reopen the guide. One MENU tap clears it and it lasts
 only for that game session.
 
+## Alpha
+
+The Allwinner display engine can be told to honour the framebuffer's alpha
+channel — `/usr/bin/setalpha` flips its layer between opaque and transparent
+through `/dev/disp` `LayerConfig`. That makes the alpha byte of everything
+written to `/dev/fb0` suddenly significant.
+
+pygame's blit *copies* source alpha rather than compositing it away, and
+SDL_ttf's Blended output is transparent outside the glyphs, so blitting a line
+of text punches an `A=0` rectangle straight through the opaque page. Invisible
+while the layer ignores alpha; the moment something leaves it in transparent
+mode, every line of text becomes a see-through bar on a washed-out background.
+
+`force_opaque` closes this by raising the whole page to `A=255` before it is
+written — `fill((0, 0, 0, 255), None, BLEND_RGBA_MAX)`, which leaves the colour
+channels byte-identical. It is on by default and there is no good reason to
+turn it off.
+
 ## Text
 
 Monospaced on purpose: GameFAQs guides are ASCII tables and maps that only

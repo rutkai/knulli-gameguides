@@ -117,6 +117,10 @@ once through SDL. Set the winner in `/userdata/system/gameguide/gameguide.conf`:
 **The guide is sideways.** Set `rotate = 90`, `180` or `270` in
 `gameguide.conf`, or use `renderer = sdl`.
 
+**Grey background, text as black bars.** The screen layer is honouring the
+alpha channel. `force_opaque = 1` in `gameguide.conf` fixes it and is the
+default; check it has not been switched off.
+
 **"No guide file was found".** The message lists every path it tried. The name
 must match the ROM exactly, minus the extension.
 
