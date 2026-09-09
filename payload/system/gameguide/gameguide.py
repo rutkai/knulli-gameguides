@@ -147,6 +147,8 @@ DEFAULTS = {
     "renderer": "fb",
     "rotate": "auto",
     "force_opaque": "1",
+    "idle_keepalive": "activity",
+    "idle_keepalive_interval": "1.0",
     "fbdev": "/dev/fb0",
     "fb_force_pan": "1",
     "fb_all_buffers": "0",
@@ -1065,6 +1067,96 @@ class PadReader:
                 self._forget(dev)
 
 
+class IdleInhibitor:
+    """
+    Keep KNULLI's idlewatcher aware that the user is still there.
+
+    idlewatcher decides the handheld is idle by reading /dev/input/event*
+    (idle=300s dims, extended=900s suspends, per
+    /etc/idlewatcher/idlewatcher.conf). We hold an exclusive EVIOCGRAB on those
+    devices, so every button the reader presses is consumed before idlewatcher
+    can see it: from its point of view the handheld has been untouched since
+    the guide opened, and it dims and then suspends mid-page.
+
+    There is no inhibit interface -- only state-change hook directories -- so
+    the fix is to put the activity back where idlewatcher is looking, by
+    emitting a harmless key on a uinput device of our own. KEY_UNKNOWN is used
+    because nothing maps it, and the device is destroyed when the guide closes.
+
+    In "activity" mode a poke is sent only when the user actually presses
+    something, rate-limited, so walking away still lets the handheld sleep on
+    schedule. "always" keeps it awake for as long as the guide is open.
+    """
+
+    IDLEWATCHER_CONF = "/etc/idlewatcher/idlewatcher.conf"
+
+    def __init__(self, mode: str = "activity", interval: float = 1.0):
+        self.mode = (mode or "activity").strip().lower()
+        self.interval = max(0.2, interval)
+        self.device = None
+        self._last = 0.0
+
+    @classmethod
+    def idle_timeout(cls) -> int:
+        """Seconds idlewatcher waits before dimming; its default is 300."""
+        try:
+            with open(cls.IDLEWATCHER_CONF) as fh:
+                for line in fh:
+                    key, _, value = line.partition("=")
+                    if key.strip() == "idle" and value.strip().isdigit():
+                        return int(value.strip())
+        except OSError:
+            pass
+        return 300
+
+    def open(self) -> None:
+        if self.mode == "off":
+            return
+        try:
+            from evdev import UInput, ecodes
+            self.device = UInput({ecodes.EV_KEY: [ecodes.KEY_UNKNOWN]},
+                                 name="gameguide-activity")
+        except Exception as exc:
+            log("idle: no uinput, the screen may dim while reading (%s)" % exc)
+            return
+        if self.mode == "always":
+            # comfortably inside the dim timeout, whatever it is set to
+            self.interval = max(5.0, min(60.0, self.idle_timeout() / 3.0))
+        log("idle: keepalive %s, every %.3gs" % (self.mode, self.interval))
+        self.poke(force=True)
+
+    def poke(self, force: bool = False) -> None:
+        """Report activity, at most once per interval."""
+        if self.device is None:
+            return
+        now = time.time()
+        if not force and now - self._last < self.interval:
+            return
+        self._last = now
+        try:
+            from evdev import ecodes
+            self.device.write(ecodes.EV_KEY, ecodes.KEY_UNKNOWN, 1)
+            self.device.syn()
+            self.device.write(ecodes.EV_KEY, ecodes.KEY_UNKNOWN, 0)
+            self.device.syn()
+        except Exception as exc:
+            log("idle: keepalive failed, giving up (%s)" % exc)
+            self.close()
+
+    def tick(self) -> None:
+        """Called every frame; only "always" mode pokes without input."""
+        if self.mode == "always":
+            self.poke()
+
+    def close(self) -> None:
+        if self.device is not None:
+            try:
+                self.device.close()
+            except Exception:
+                pass
+            self.device = None
+
+
 # ---------------------------------------------------------------------------
 # guide discovery
 # ---------------------------------------------------------------------------
@@ -1422,6 +1514,10 @@ def run_viewer(conf: dict, out, pad: PadReader, lines: list[str],
     if pad.axis_info:
         viewer.help_rows.insert(4, STICK_HELP_ROW)
 
+    idle = IdleInhibitor(conf.get("idle_keepalive", "activity"),
+                         conf_float(conf, "idle_keepalive_interval", 1.0))
+    idle.open()
+
     held: dict[str, float] = {}      # action -> next repeat timestamp
     stick: dict[int, float] = {}     # abs code -> normalised -1.0 .. 1.0
     stick_accumulator = 0.0
@@ -1466,7 +1562,14 @@ def run_viewer(conf: dict, out, pad: PadReader, lines: list[str],
             viewer.draw()
             viewer.dirty = False
 
-        for ev in pad.poll(frame_time):
+        events = pad.poll(frame_time)
+        if events:
+            # We swallowed these before idlewatcher could see them, so report
+            # the activity ourselves; otherwise reading counts as being idle.
+            idle.poke()
+        idle.tick()
+
+        for ev in events:
             if ev.type == EV_KEY:
                 name = mapping.buttons.get(ev.code)
                 if not name:
@@ -1512,6 +1615,7 @@ def run_viewer(conf: dict, out, pad: PadReader, lines: list[str],
         else:
             stick_accumulator = 0.0
 
+    idle.close()
     viewer.save_position()
 
 

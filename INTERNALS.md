@@ -91,6 +91,25 @@ written — `fill((0, 0, 0, 255), None, BLEND_RGBA_MAX)`, which leaves the colou
 channels byte-identical. It is on by default and there is no good reason to
 turn it off.
 
+## Idle
+
+`idlewatcher` decides the handheld is idle by reading `/dev/input/event*`
+(`idle=300` dims, `extended=900` suspends, from
+`/etc/idlewatcher/idlewatcher.conf`). The guide holds an exclusive `EVIOCGRAB`
+on those devices, so every press it consumes is a press idlewatcher never
+sees: from its point of view nothing has been touched since the guide opened,
+and it dims and then suspends mid-page.
+
+It offers no inhibit interface — only `active.d` / `idle.d` / `extended.d`
+hook directories for reacting to transitions — so activity is put back where
+it is looking, by emitting `KEY_UNKNOWN` on a uinput device of our own. The
+node appears in `/dev/input` as `gameguide-activity` and is destroyed before
+the emulator is resumed, so nothing else ever enumerates it.
+
+`idle_keepalive = activity` (the default) reports only when the user actually
+presses something, rate-limited, so putting the handheld down still lets it
+sleep on schedule; `always` keeps it awake for as long as the guide is open.
+
 ## Text
 
 Monospaced on purpose: GameFAQs guides are ASCII tables and maps that only

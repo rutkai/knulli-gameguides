@@ -121,6 +121,12 @@ once through SDL. Set the winner in `/userdata/system/gameguide/gameguide.conf`:
 alpha channel. `force_opaque = 1` in `gameguide.conf` fixes it and is the
 default; check it has not been switched off.
 
+**The screen dims, or the handheld sleeps, while I am reading.** Fixed by
+default. KNULLI decides you are idle by watching the buttons, and the guide
+takes those over while it is open, so it now reports your presses back. If it
+still happens, check `idle_keepalive` in `gameguide.conf` is not `off`; set it
+to `always` to stay awake for as long as the guide is up, even untouched.
+
 **"No guide file was found".** The message lists every path it tried. The name
 must match the ROM exactly, minus the extension.
 
